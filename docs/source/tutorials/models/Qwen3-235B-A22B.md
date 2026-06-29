@@ -120,14 +120,13 @@ vllm serve vllm-ascend/Qwen3-235B-A22B-w8a8 \
 --gpu-memory-utilization 0.95 \
 --hf-overrides '{"rope_parameters": {"rope_type":"yarn","rope_theta":1000000,"factor":4,"original_max_position_embeddings":32768}}' \
 --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
---async-scheduling
 ```
 
 **Notice:**
 
 - [Qwen3-235B-A22B](https://huggingface.co/Qwen/Qwen3-235B-A22B#processing-long-texts) originally only supports 40960 context(max_position_embeddings). If you want to use it and its related quantization weights to run long seqs (such as 128k context), it is required to use yarn rope-scaling technique.
     - For vLLM version same as or new than `v0.12.0`, use parameter: `--hf-overrides '{"rope_parameters": {"rope_type":"yarn","rope_theta":1000000,"factor":4,"original_max_position_embeddings":32768}}' \`.
-    - For vllm version below `v0.12.0`, use parameter: `--rope_scaling '{"rope_type":"yarn","factor":4,"original_max_position_embeddings":32768}' \`.
+    - For vLLM version below `v0.12.0`, use parameter: `--rope_scaling '{"rope_type":"yarn","factor":4,"original_max_position_embeddings":32768}' \`.
   If you are using weights like [Qwen3-235B-A22B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507) which originally supports long contexts, there is no need to add this parameter.
 
 The parameters are explained as follows:
@@ -150,7 +149,7 @@ The parameters are explained as follows:
 
 ### Multi-node Deployment with MP (Recommended)
 
-Assume you have Atlas 800 A3 (64G*16) nodes (or 2* A2), and want to deploy the `Qwen3-VL-235B-A22B-Instruct` model across multiple nodes.
+Assume you have Atlas 800 A3 (64G*16) nodes (or 2* A2), and want to deploy the `Qwen3-VL-235B-A22B` model across multiple nodes.
 
 Node 0
 
@@ -190,7 +189,6 @@ vllm serve Qwen/Qwen3-235B-A22B \
 --max-model-len 32768 \
 --max-num-batched-tokens 4096 \
 --trust-remote-code \
---async-scheduling \
 --gpu-memory-utilization 0.9
 ```
 
@@ -236,7 +234,6 @@ vllm serve Qwen/Qwen3-235B-A22B \
 --max-num-batched-tokens 4096 \
 --enable-expert-parallel \
 --trust-remote-code \
---async-scheduling \
 --gpu-memory-utilization 0.9 \
 ```
 
@@ -319,15 +316,6 @@ After about several minutes, you can get the performance evaluation result.
 
 In this section, we provide simple scripts to re-produce our latest performance. It is also recommended to read instructions above to understand basic concepts or options in vLLM && vLLM-Ascend.
 
-### Environment
-
-- vLLM v0.13.0
-- vLLM-Ascend v0.13.0rc1
-- CANN 8.3.RC2
-- torch_npu 2.8.0
-- HDK/driver 25.3.RC1
-- triton_ascend 3.2.0
-
 ### Single Node A3 (64G*16)
 
 Example server scripts:
@@ -362,7 +350,6 @@ vllm serve vllm-ascend/Qwen3-235B-A22B-w8a8 \
 --gpu-memory-utilization 0.9 \
 --no-enable-prefix-caching \
 --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
---async-scheduling
 ```
 
 Benchmark scripts:
@@ -445,7 +432,6 @@ vllm serve vllm-ascend/Qwen3-235B-A22B-w8a8 \
 '{"kv_connector": "MooncakeConnectorV1",
 "kv_role": "kv_producer",
 "kv_port": "30000",
-"engine_id": "0",
 "kv_connector_extra_config": {
       "prefill": {
             "dp_size": 2,
@@ -503,13 +489,11 @@ vllm serve vllm-ascend/Qwen3-235B-A22B-w8a8 \
 --trust-remote-code \
 --gpu-memory-utilization 0.9 \
 --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
---async-scheduling \
 --no-enable-prefix-caching \
 --kv-transfer-config \
 '{"kv_connector": "MooncakeConnectorV1",
 "kv_role": "kv_consumer",
 "kv_port": "30100",
-"engine_id": "1",
 "kv_connector_extra_config": {
       "prefill": {
             "dp_size": 2,
@@ -568,13 +552,11 @@ vllm serve vllm-ascend/Qwen3-235B-A22B-w8a8 \
 --trust-remote-code \
 --gpu-memory-utilization 0.9 \
 --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
---async-scheduling \
 --no-enable-prefix-caching \
 --kv-transfer-config \
 '{"kv_connector": "MooncakeConnectorV1",
 "kv_role": "kv_consumer",
 "kv_port": "30100",
-"engine_id": "1",
 "kv_connector_extra_config": {
       "prefill": {
             "dp_size": 2,

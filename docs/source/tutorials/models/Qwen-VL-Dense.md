@@ -397,7 +397,6 @@ export VLLM_USE_V1=1
 vllm serve Qwen/Qwen3-VL-32B-Instruct \
     --host 0.0.0.0 \
     --port 8000 \
-    --async-scheduling \
     --tensor-parallel-size 2 \
     --max-model-len 30000 \
     --max-num-batched-tokens 50000 \
@@ -409,7 +408,7 @@ vllm serve Qwen/Qwen3-VL-32B-Instruct \
 ```
 
 :::{note}
-Add `--max_model_len` option to avoid ValueError that the Qwen3-VL-32B-Instruct model's max_model_len (128000) is larger than the maximum number of tokens that can be stored in KV cache. This will differ with different NPU series base on the on-chip memory size. Please modify the value according to a suitable value for your NPU series.
+Add `--max_model_len` option to avoid ValueError that the Qwen3-VL-32B-Instruct model's max_model_len (128000) is larger than the maximum number of tokens that can be stored in KV cache. This will differ with different NPU series based on the on-chip memory size. Please modify the value according to a suitable value for your NPU series.
 :::
 
 If your service start successfully, you can see the info shown below:

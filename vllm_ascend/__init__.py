@@ -15,6 +15,8 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import vllm_ascend.logger  # noqa: F401
+
 _GLOBAL_PATCH_APPLIED = False
 
 
@@ -45,8 +47,10 @@ def register_connector():
     _ensure_global_patch()
 
     from vllm_ascend.distributed.kv_transfer import register_connector
+    from vllm_ascend.distributed.weight_transfer import register_engine
 
     register_connector()
+    register_engine()
 
 
 def register_model_loader():
@@ -65,3 +69,9 @@ def register_service_profiling():
     from .profiling_config import generate_service_profiling_config
 
     generate_service_profiling_config()
+
+
+def register_model():
+    from .models import register_model
+
+    register_model()
