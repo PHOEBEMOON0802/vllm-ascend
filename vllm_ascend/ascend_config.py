@@ -631,6 +631,7 @@ class AscendConfig:
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
+    bolt_config: BoltConfig = dataclasses.field(default_factory=lambda: BoltConfig())
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)
@@ -1318,6 +1319,121 @@ class DynamicSpecConfig:
         if self.method is not None and self.method not in self.SUPPORTED_METHODS:
             raise ValueError(
                 f"dynamic_spec_config.method must be one of {self.SUPPORTED_METHODS} or None, got {self.method!r}"
+            )
+        return self
+
+
+@config
+class BoltConfig:
+    """Configuration Object for ``additional_config["bolt_config"]``.
+
+    BOLT (Block-level Online Learning for Target-aligned draft) maintains a
+    per-request delta matrix that is updated online after each verify block
+    using teacher feedback, improving draft token acceptance rates.
+
+    The delta is request-private and initialized to zero. After each verify
+    block, an analytical gradient (CE+TV loss) is computed and the delta is
+    updated via the configured optimizer. The updated delta is applied to the
+    next propose cycle's markov bias, making draft proposals progressively
+    better aligned with the teacher distribution.
+
+    Supported head modes:
+      - ``vanilla_residual``: delta [r, r] applied as ``markov_emb @ delta``
+        before the W2 projection. Compatible with vanilla markov heads.
+      - ``bounded``: delta [r, 2r+d] applied to the output-gate rows of the
+        RNN joint_proj weight. Requires ``markov_head_type="rnn"``.
+        NOT IMPLEMENTED YET — rejected at config validation time.
+    """
+
+    # Whether BOLT online update is enabled.
+    # When False, no delta is applied or updated (static mode).
+    enabled: bool = False
+
+    # Optimizer type for delta update: 'muon', 'sgdm', or 'adam'.
+    # 'muon' (default): Newton-Schulz orthogonalization + Nesterov momentum.
+    # 'sgdm': SGD with momentum.
+    # 'adam': Standard Adam optimizer.
+    optimizer: str = "muon"
+
+    # Learning rate for delta update.
+    lr: float = 0.005
+
+    # Position weight decay rate: alpha[k] = exp(-k / gamma).
+    # Controls how much weight is given to earlier draft positions in the
+    # gradient. Larger gamma → more uniform weighting.
+    gamma: float = 4.0
+
+    # Anchor regularization coefficient.
+    # Penalizes deviation from the reference (delta=0) logits projection.
+    anchor_lambda: float = 0.5
+
+    # Loss type: 'cetv' (CE+TV, default) or 'kl' (KL divergence).
+    loss: str = "cetv"
+
+    # CE loss weight (only used when loss='cetv').
+    ce_weight: float = 0.5
+
+    # TV loss weight (only used when loss='cetv').
+    tv_weight: float = 0.5
+
+    # Head mode: 'vanilla_residual' (default) or 'bounded'.
+    head_mode: str = "vanilla_residual"
+
+    # SGD momentum (only used when optimizer='sgdm').
+    sgd_momentum: float = 0.9
+
+    # Gradient clipping threshold (L2 norm).
+    clip: float = 1.0
+
+    # Metrics output directory. If non-empty, per-request metrics are
+    # written as JSON files to this directory.
+    metrics_dir: str = ""
+
+    # Number of update steps per verify block (multi-step on fixed proposal).
+    update_steps: int = 1
+
+    # Debug mode: print per-block update statistics.
+    debug: bool = False
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.optimizer not in ("muon", "sgdm", "adam"):
+            raise ValueError(
+                f"bolt_config.optimizer must be 'muon', 'sgdm', or 'adam', "
+                f"got {self.optimizer!r}"
+            )
+        if self.head_mode not in ("vanilla_residual", "bounded"):
+            raise ValueError(
+                f"bolt_config.head_mode must be 'vanilla_residual' or 'bounded', "
+                f"got {self.head_mode!r}"
+            )
+        if self.head_mode == "bounded":
+            raise ValueError(
+                "bolt_config.head_mode='bounded' is not implemented yet; "
+                "use 'vanilla_residual'"
+            )
+        if self.loss not in ("cetv", "kl"):
+            raise ValueError(
+                f"bolt_config.loss must be 'cetv' or 'kl', got {self.loss!r}"
+            )
+        if self.lr <= 0:
+            raise ValueError(f"bolt_config.lr must be > 0, got {self.lr}")
+        if self.gamma <= 0:
+            raise ValueError(f"bolt_config.gamma must be > 0, got {self.gamma}")
+        if self.clip <= 0:
+            raise ValueError(f"bolt_config.clip must be > 0, got {self.clip}")
+        if self.update_steps < 1:
+            raise ValueError(
+                f"bolt_config.update_steps must be >= 1, got {self.update_steps}"
+            )
+        if self.ce_weight < 0 or self.tv_weight < 0:
+            raise ValueError(
+                f"bolt_config.ce_weight/tv_weight must be >= 0, got "
+                f"{self.ce_weight}/{self.tv_weight}"
+            )
+        if self.anchor_lambda < 0:
+            raise ValueError(
+                f"bolt_config.anchor_lambda must be >= 0, got {self.anchor_lambda}"
             )
         return self
 

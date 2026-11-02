@@ -1583,9 +1583,83 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 draft_token_ids = self._dspark_draft_buffer[:num_blk]
                 draft_token_ids[:, 0].copy_(self._dspark_seed_buffer[:num_blk])
                 dspark_probs_list: list[torch.Tensor] = []
+
+                # BOLT: check if BoltManager is active for this draft model.
+                # The per-row request mapping (set by the model runner each
+                # step) must cover every batch row; otherwise deltas cannot be
+                # attributed reliably and BOLT is skipped for this cycle.
+                bolt_mgr = getattr(self.model, "bolt_manager", None)
+                bolt_batch_req_ids = getattr(
+                    self.model, "_bolt_batch_req_ids", None
+                )
+                bolt_active = bool(
+                    bolt_mgr is not None
+                    and (bolt_mgr.enabled or bolt_mgr.metrics_enabled)
+                    and bolt_mgr.states
+                    and bolt_batch_req_ids is not None
+                    and len(bolt_batch_req_ids) == num_blk
+                )
+                if bolt_mgr is not None:
+                    # Consume the mapping: it is valid for exactly one propose
+                    # cycle. Dummy/profile runs reach this loop without the
+                    # runner refreshing it and must not reuse a stale list.
+                    self.model._bolt_batch_req_ids = None
+                # Delta injection (and tensor saving for the update) only
+                # happens in enabled mode; metrics-only mode just records the
+                # proposed draft tokens.
+                bolt_apply_delta = bolt_active and bolt_mgr.enabled
+
+                # Per-request deltas are constant across draft positions:
+                # stack them once before the position loop.
+                bolt_deltas = None
+                if bolt_apply_delta:
+                    # get_delta returns W2's dtype; the zeros fallback must
+                    # match or torch.stack raises on mixed dtypes.
+                    _delta_dtype = (
+                        bolt_mgr.W2.dtype
+                        if bolt_mgr.W2 is not None else logits.dtype
+                    )
+                    deltas_list = []
+                    for rid in bolt_batch_req_ids:
+                        d = bolt_mgr.get_delta(str(rid))
+                        if d is None:
+                            d = torch.zeros(
+                                bolt_mgr.r,
+                                bolt_mgr.r,
+                                device=logits.device,
+                                dtype=_delta_dtype,
+                            )
+                        deltas_list.append(d)
+                    bolt_deltas = torch.stack(deltas_list, dim=0).to(
+                        logits.dtype
+                    )  # [B, r, r]
+
+                # Collect per-position markov embeddings for BOLT
+                # save_proposal, and snapshot the pre-bias base logits (the
+                # gradient recomputes q = base + (e + e @ delta) @ W2.T, so
+                # the saved base must NOT include any markov bias).
+                bolt_prev_emb_list: list[torch.Tensor] = []
+                bolt_base_logits = (
+                    logits.detach().clone() if bolt_apply_delta else None
+                )
+
                 for idx in range(self.num_speculative_tokens):
                     markov_emb = self.model.markov_embed(draft_token_ids[:, idx])
-                    logits_bias = self.model.markov_bias(markov_emb)
+
+                    if bolt_apply_delta:
+                        # BOLT delta injection (vanilla_residual mode):
+                        # bias = (markov_emb + markov_emb @ delta) @ W2.T
+                        delta_bias = torch.bmm(
+                            markov_emb.unsqueeze(1),
+                            bolt_deltas,
+                        ).squeeze(1)  # [B, r]
+                        logits_bias = self.model.markov_bias(
+                            markov_emb + delta_bias
+                        )
+                        bolt_prev_emb_list.append(markov_emb.detach())
+                    else:
+                        logits_bias = self.model.markov_bias(markov_emb)
+
                     logits[:, idx].add_(logits_bias)
                     if use_probabilistic:
                         # Use probabilistic sampling instead of argmax.
@@ -1600,6 +1674,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         if dspark_has_vocab_mapping:
                             next_token_ids = self.model.map_draft_to_target(next_token_ids)
                         draft_token_ids[:, idx + 1].copy_(next_token_ids)
+
+                # BOLT: save_proposal — store (e, base, draft_tokens) for the
+                # post-verify update. Row b maps to bolt_batch_req_ids[b].
+                # In metrics-only mode e/base are None (only the proposed
+                # tokens are needed for acceptance accounting).
+                if bolt_active:
+                    prev_emb_stacked = (
+                        torch.stack(bolt_prev_emb_list, dim=1)  # [B, K, r]
+                        if bolt_prev_emb_list else None
+                    )
+                    for b_idx, rid in enumerate(bolt_batch_req_ids):
+                        bolt_mgr.save_proposal(
+                            str(rid),
+                            prev_emb_stacked[b_idx:b_idx + 1]
+                            if prev_emb_stacked is not None else None,  # [1, K, r]
+                            bolt_base_logits[b_idx:b_idx + 1]
+                            if bolt_base_logits is not None else None,  # [1, K, V]
+                            # Proposed tokens (col 0 is the seed, cols 1..K
+                            # are the K drafts verified against the target
+                            # logits rows 0..K-1).
+                            draft_token_ids[b_idx:b_idx + 1, 1:self.num_speculative_tokens + 1],  # [1, K]
+                        )
                 if use_probabilistic and dspark_probs_list:
                     # Stack [K x [num_blk, V]] -> [num_blk, K, V] ->
                     # [num_blk * K, V] to match early_exit view logic.

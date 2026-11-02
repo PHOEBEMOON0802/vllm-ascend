@@ -771,6 +771,27 @@ class NPUModelRunner(GPUModelRunner):
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
 
+    def _get_bolt_manager(self):
+        """Return the BoltManager if BOLT is enabled for this runner.
+
+        BOLT is only active when:
+            1. Speculative decoding is enabled with method='dspark'.
+            2. The draft model has a ``bolt_manager`` attribute (set during
+            model initialization when bolt_config.enabled=True).
+
+        Returns None when BOLT is not active.
+        """
+        if (
+            self.speculative_config is None
+            or self.speculative_config.method != "dspark"
+        ):
+            return None
+        drafter = getattr(self, "drafter", None)
+        if drafter is None:
+            return None
+        model = getattr(drafter, "model", None)
+        return getattr(model, "bolt_manager", None)
+
     def _eagle3_uses_aux_hidden_state(self) -> bool:
         if self.speculative_config is None or self.speculative_config.method != "eagle3":
             return False
@@ -973,6 +994,14 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
+        # BOLT: capture finished and new req_ids BEFORE super() removes them.
+        bolt_mgr = self._get_bolt_manager()
+        bolt_finished = list(scheduler_output.finished_req_ids) if bolt_mgr else []
+        bolt_new = (
+            [x.req_id for x in scheduler_output.scheduled_new_reqs]
+            if bolt_mgr else []
+        )
+
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
         if scheduler_output.kv_cache_block_copies:
             # The upstream helper assumes one block-major backing storage.
@@ -994,6 +1023,21 @@ class NPUModelRunner(GPUModelRunner):
             )
         sampling_metadata = super()._update_states(scheduler_output)
         self._track_tmp_encoder_cache_refs(scheduler_output)
+
+        # BOLT: request lifecycle hooks - release finished, create new.
+        if bolt_mgr is not None:
+            cached_reqs = getattr(
+                scheduler_output, "scheduled_cached_reqs", None
+            )
+            resumed_set = (
+                set(cached_reqs.resumed_req_ids) if cached_reqs else set()
+            )
+            for req_id in bolt_finished:
+                bolt_mgr.on_request_finished(str(req_id))
+            for req_id in bolt_new:
+                if str(req_id) not in resumed_set:
+                    bolt_mgr.on_request_new(str(req_id))
+
         return sampling_metadata
 
     def _update_states_after_model_execute(
@@ -2820,6 +2864,82 @@ class NPUModelRunner(GPUModelRunner):
             self.sampling_done_event.record()
 
         self.valid_sampled_token_count_gpu = None
+
+        # BOLT update: use saved draft outputs (from previous propose) +
+        # current target logits to update per-request delta, BEFORE the next
+        # propose cycle. Thread req_ids so each request updates its own delta.
+        bolt_mgr = self._get_bolt_manager()
+        _bolt_ndt_list = (
+            getattr(spec_decode_metadata, "num_draft_tokens", None)
+            if spec_decode_metadata is not None else None
+        )
+        _bolt_req_ids_all = (
+            list(self.input_batch.req_ids) if bolt_mgr is not None else []
+        )
+        if (
+                bolt_mgr is not None
+                and bolt_mgr.states
+                and spec_decode_metadata is not None
+                and logits is not None
+                # Without a trustworthy per-request draft-token count the
+                # offsets into target_logits_indices cannot be attributed;
+                # skip BOLT entirely rather than guess.
+                and _bolt_ndt_list
+                and len(_bolt_ndt_list) == len(_bolt_req_ids_all)
+        ):
+            _tl_idx = spec_decode_metadata.target_logits_indices
+            _K = bolt_mgr.K
+            _V = logits.shape[-1]
+            _tl_flat = logits[_tl_idx]  # [num_tl, V]
+            _offset = 0
+            _bolt_req_ids: list[str] = []
+            _bolt_tl_list: list[torch.Tensor] = []
+            _bolt_len_list: list[int] = []
+            for _i, _rid in enumerate(_bolt_req_ids_all):
+                _rid_s = str(_rid)
+                _ndt = _bolt_ndt_list[_i]
+                _st = bolt_mgr.states.get(_rid_s)
+                if _st is None or _st.saved_draft is None or _ndt <= 0:
+                    _offset += _ndt
+                    continue
+                _tl_slice = _tl_flat[_offset:_offset + _ndt]
+                _offset += _ndt
+                _valid = min(_ndt, _K)
+                # Pad to K rows; padded rows are masked out of the gradient
+                # via valid_lens and excluded from verify metrics below.
+                if _ndt >= _K:
+                    _target_logits = _tl_slice[:_K].unsqueeze(0)  # [1, K, V]
+                else:
+                    _pad = torch.zeros(
+                        _K - _ndt, _V,
+                        device=_tl_flat.device, dtype=_tl_flat.dtype,
+                    )
+                    _target_logits = torch.cat([_tl_slice, _pad], 0).unsqueeze(0)
+                # Record verification metrics (always, even in static mode),
+                # using only the valid (unpadded) rows.
+                bolt_mgr.record_verify(_rid_s, _target_logits[:, :_valid])
+                # Collect for batched BOLT update
+                if bolt_mgr.enabled:
+                    _bolt_req_ids.append(_rid_s)
+                    _bolt_tl_list.append(_target_logits)
+                    _bolt_len_list.append(_valid)
+            # Batched BOLT update: all requests in ONE pass
+            if _bolt_req_ids:
+                bolt_mgr.bolt_update_batch(
+                    _bolt_req_ids, _bolt_tl_list, _bolt_len_list
+                )
+
+        # BOLT: start a new propose round (releases stale saved proposals)
+        # and pass per-batch req_ids to the draft model so the upcoming
+        # propose can attribute deltas per request. The proposer consumes
+        # the mapping, so dummy runs never see a stale list.
+        if bolt_mgr is not None:
+            bolt_mgr.begin_round()
+            _dm = getattr(self.drafter, "model", None) if self.drafter else None
+            if _dm is not None:
+                _dm._bolt_batch_req_ids = [
+                    str(r) for r in self.input_batch.req_ids
+                ]
 
         input_fits_in_drafter = self.speculative_config is None or self._input_fits_in_drafter(
             spec_decode_common_attn_metadata
