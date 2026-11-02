@@ -42,6 +42,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var, falling back to default on absence/garbage."""
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Optimizers (per-request state)
 # ---------------------------------------------------------------------------
@@ -264,6 +272,27 @@ class BoltManager:
         self._verify_error_logged = False
         self._vocab_mismatch_logged = False
 
+        # Debug printing (observe per-request metric evolution live).
+        # Controlled by env vars, in addition to bolt_config.debug:
+        #   VLLM_ASCEND_BOLT_DEBUG: 0=off (default), 1=per-verify-block
+        #     acceptance line + per-request finish summary, 2=additionally
+        #     per-update gradient/delta statistics.
+        #   VLLM_ASCEND_BOLT_DEBUG_INTERVAL: print the verify line every N
+        #     blocks per request (default 1; raise to tame high-QPS logs).
+        # bolt_config.debug=true is equivalent to level 2.
+        self._debug_level = _env_int("VLLM_ASCEND_BOLT_DEBUG", 0)
+        if config.debug and self._debug_level < 2:
+            self._debug_level = 2
+        self._debug_interval = max(
+            1, _env_int("VLLM_ASCEND_BOLT_DEBUG_INTERVAL", 1)
+        )
+        if self._debug_level > 0:
+            logger.info(
+                "[BOLT] debug printing enabled: level=%d interval=%d "
+                "(VLLM_ASCEND_BOLT_DEBUG / VLLM_ASCEND_BOLT_DEBUG_INTERVAL)",
+                self._debug_level, self._debug_interval,
+            )
+
     @property
     def metrics_enabled(self) -> bool:
         """Whether per-request metrics collection is requested."""
@@ -322,6 +351,21 @@ class BoltManager:
         st.finished = True
         self._finish_counter += 1
         self._output_request_metrics(req_id, st, self._finish_counter)
+        if self._debug_level >= 1:
+            rounds = max(1, st.verify_rounds)
+            delta_max = (
+                st.optimizer.delta.abs().max().item()
+                if st.optimizer is not None and st.update_count > 0 else 0.0
+            )
+            logger.info(
+                "[BOLT][finish] req=%s rounds=%d accepted_total=%d "
+                "tau=%.3f tau_bonus=%.3f committed=%d updates=%d "
+                "delta_max=%.6f",
+                req_id, st.verify_rounds, st.accepted_draft_tokens,
+                st.accepted_draft_tokens / rounds,
+                (st.accepted_draft_tokens + st.verify_rounds) / rounds,
+                st.committed_tokens, st.update_count, delta_max,
+            )
 
     def _output_request_metrics(self, req_id: str, st: ReqState, finish_idx: int):
         if not self._metrics_dir:
@@ -478,6 +522,23 @@ class BoltManager:
             else:
                 st.accept_hist[-1] += 1
             st.last_accepted = accepted
+
+            if (
+                self._debug_level >= 1
+                and st.verify_rounds % self._debug_interval == 0
+            ):
+                rounds = st.verify_rounds
+                logger.info(
+                    "[BOLT][verify] req=%s round=%d accepted=%d/%d "
+                    "tau=%.3f tau_bonus=%.3f zero_pct=%.1f full_pct=%.1f "
+                    "updates=%d",
+                    req_id, rounds, accepted, K_actual,
+                    st.accepted_draft_tokens / rounds,
+                    (st.accepted_draft_tokens + rounds) / rounds,
+                    100.0 * st.zero_accept_rounds / rounds,
+                    100.0 * st.full_block_rounds / rounds,
+                    st.update_count,
+                )
         except Exception:
             if not self._verify_error_logged:
                 self._verify_error_logged = True
@@ -619,12 +680,16 @@ class BoltManager:
             st.saved_base = None
             st.saved_draft = None
 
-        if self.config.debug:
+        if self._debug_level >= 2:
             for rid, st, _, _ in valid:
                 dn = st.optimizer.delta.abs().max().item()
                 logger.info(
-                    "[BOLT] req=%s update #%d: delta_max=%.6f",
+                    "[BOLT][update] req=%s update#%d delta_max=%.6f "
+                    "grad_norm_mean=%.4f grad_norm_max=%.4f clip_ratio=%.2f",
                     rid, st.update_count, dn,
+                    st.grad_norm_sum / max(1, st.update_count),
+                    st.grad_norm_max,
+                    st.clip_ratio_sum / max(1, st.update_count),
                 )
 
     # ---- Legacy / utility ----

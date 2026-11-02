@@ -381,3 +381,62 @@ class TestUpdateBatch:
         mgr.bolt_update_batch(["a"], [tl], [K])
         after = ce_loss(mgr.states["a"].optimizer.delta)
         assert after < before
+
+
+class TestDebugEnv:
+
+    def test_debug_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("VLLM_ASCEND_BOLT_DEBUG", raising=False)
+        assert make_manager()._debug_level == 0
+
+    def test_debug_level_and_interval_from_env(self, monkeypatch):
+        monkeypatch.setenv("VLLM_ASCEND_BOLT_DEBUG", "1")
+        monkeypatch.setenv("VLLM_ASCEND_BOLT_DEBUG_INTERVAL", "5")
+        mgr = make_manager()
+        assert mgr._debug_level == 1
+        assert mgr._debug_interval == 5
+
+    def test_config_debug_implies_level2(self, monkeypatch):
+        monkeypatch.delenv("VLLM_ASCEND_BOLT_DEBUG", raising=False)
+        assert make_manager(debug=True)._debug_level == 2
+
+    def test_garbage_env_falls_back(self, monkeypatch):
+        monkeypatch.setenv("VLLM_ASCEND_BOLT_DEBUG", "yes")
+        monkeypatch.setenv("VLLM_ASCEND_BOLT_DEBUG_INTERVAL", "oops")
+        mgr = make_manager()
+        assert mgr._debug_level == 0
+        assert mgr._debug_interval == 1
+
+    def test_debug_smoke_full_cycle(self, monkeypatch, caplog):
+        """Debug printing must not break verify/update/finish, and must
+        emit the expected lines at level 2."""
+        monkeypatch.setenv("VLLM_ASCEND_BOLT_DEBUG", "2")
+        monkeypatch.setenv("VLLM_ASCEND_BOLT_DEBUG_INTERVAL", "1")
+        mgr = make_manager()
+        mgr.on_request_new("a")
+        torch.manual_seed(0)
+        mgr.save_proposal("a", torch.randn(1, K, R), torch.randn(1, K, V),
+                          torch.randint(0, V, (1, K)))
+        with caplog.at_level(
+                "INFO", logger="vllm_ascend.spec_decode.bolt_manager"):
+            mgr.record_verify("a", torch.randn(1, K, V))
+            mgr.bolt_update_batch(["a"], [torch.randn(1, K, V)], [K])
+            mgr.on_request_finished("a")
+        assert "[BOLT][verify]" in caplog.text
+        assert "[BOLT][update]" in caplog.text
+        assert "[BOLT][finish]" in caplog.text
+
+    def test_no_debug_lines_when_disabled(self, monkeypatch, caplog):
+        monkeypatch.delenv("VLLM_ASCEND_BOLT_DEBUG", raising=False)
+        mgr = make_manager()
+        mgr.on_request_new("a")
+        mgr.save_proposal("a", torch.randn(1, K, R), torch.randn(1, K, V),
+                          torch.randint(0, V, (1, K)))
+        with caplog.at_level(
+                "INFO", logger="vllm_ascend.spec_decode.bolt_manager"):
+            mgr.record_verify("a", torch.randn(1, K, V))
+            mgr.bolt_update_batch(["a"], [torch.randn(1, K, V)], [K])
+            mgr.on_request_finished("a")
+        assert "[BOLT][verify]" not in caplog.text
+        assert "[BOLT][update]" not in caplog.text
+        assert "[BOLT][finish]" not in caplog.text
