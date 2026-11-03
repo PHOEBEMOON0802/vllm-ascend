@@ -70,12 +70,21 @@ def cetv_residual_gradient_batch(
     K_actual: int,                  # number of draft positions
     ce_weight: float = 0.5,
     tv_weight: float = 0.5,
+    row_chunk: int = 64,
 ) -> torch.Tensor:
     """Batched CE+TV gradient for vanilla_residual head mode.
 
     Computes dL/d(delta) for each request in the batch, where:
         q_logits = base + (e + e @ delta) @ W2.T
         L = ce_weight * L_ce + tv_weight * L_tv + anchor_lambda * L_anchor
+
+    Fused implementation: each of q / teacher / ref gets exactly ONE
+    softmax over the vocab dim, reused for both the W2 projection and the
+    TV indicator (3 full-vocab passes instead of 5), and the per-request
+    bias bmm is flattened into one [B*K, r] @ [r, V] matmul. Rows are
+    processed in ``row_chunk`` chunks to bound the peak extra memory to
+    ~3 * row_chunk * V floats (B=1 workloads fit in a single chunk, which
+    minimizes kernel-launch count on NPU).
 
     Args:
         e_batch: [B, K, r] markov embeddings (W1[prev_token]).
@@ -88,63 +97,52 @@ def cetv_residual_gradient_batch(
         K_actual: number of draft positions to use (<=K).
         ce_weight: CE loss weight.
         tv_weight: TV loss weight.
+        row_chunk: rows (B*K) per fused softmax/projection chunk.
 
     Returns:
         [B, r, r] gradient tensor per request.
     """
     e = e_batch[:, :K_actual, :].to(torch.float32)          # [B, K, r]
     base = base_batch[:, :K_actual, :].to(torch.float32)    # [B, K, V]
-    deltas = deltas_batch.to(torch.float32)           # [B, r, r]
+    deltas = deltas_batch.to(torch.float32)                 # [B, r, r]
     W2_f = W2.to(torch.float32)                             # [V, r]
     tl = tl_batch[:, :K_actual, :].to(torch.float32)        # [B, K, V]
     alpha = alpha_batch[:, :K_actual].to(torch.float32)     # [B, K]
 
     B, K, r = e.shape
+    rows = B * K
 
-    # Compute q_logits = base + (e + e @ delta) @ W2.T
-    # e @ delta: [B, K, r] @ [B, r, r] -> [B, K, r]
+    # q_logits = base + (e + e @ delta) @ W2.T ; ref = base + e @ W2.T
     e_delta = torch.bmm(e, deltas)                          # [B, K, r]
-    # (e + e_delta) @ W2.T: [B, K, r] @ [r, V] -> [B, K, V]
-    bias = torch.bmm(e + e_delta, W2_f.t().unsqueeze(0).expand(B, -1, -1))
-    q_logits = base + bias                                  # [B, K, V]
+    base_flat = base.reshape(rows, -1)                      # [rows, V]
+    q_logits = base_flat + (e + e_delta).reshape(rows, r) @ W2_f.t()
+    ref_logits = base_flat + e.reshape(rows, r) @ W2_f.t()
+    tl_flat = tl.reshape(rows, -1)                          # [rows, V]
 
-    # Compute reference logits (delta=0): ref = base + e @ W2.T
-    ref_bias = torch.bmm(e, W2_f.t().unsqueeze(0).expand(B, -1, -1))
-    ref_logits = base + ref_bias                            # [B, K, V]
+    # du = dL/d(q_proj), computed in row chunks with softmax reuse.
+    du_flat = torch.empty(rows, r, dtype=torch.float32, device=e.device)
+    for start in range(0, rows, row_chunk):
+        end = min(start + row_chunk, rows)
+        q_sm = torch.softmax(q_logits[start:end], dim=-1)
+        p_sm = torch.softmax(tl_flat[start:end], dim=-1)
+        ref_sm = torch.softmax(ref_logits[start:end], dim=-1)
+        q_proj = q_sm @ W2_f                                # [c, r]
+        teacher_proj = p_sm @ W2_f
+        ref_proj = ref_sm @ W2_f
+        # CE: ce_weight * (q_proj - teacher_proj)
+        du = ce_weight * (q_proj - teacher_proj)
+        # TV: indicator = (q_softmax < p_softmax), reusing the softmaxes.
+        indicator_weighted = (q_sm < p_sm).to(torch.float32) * q_sm
+        du = du + tv_weight * (
+            indicator_weighted @ W2_f
+            - indicator_weighted.sum(-1, keepdim=True) * q_proj
+        )
+        # Anchor: anchor_lambda * (q_proj - ref_proj)
+        du = du + anchor_lambda * (q_proj - ref_proj)
+        du_flat[start:end] = du
 
-    # Projections: softmax(logits) @ W2
-    q_proj = exact_projection(q_logits, W2_f)               # [B, K, r]
-    teacher_proj = exact_projection(tl, W2_f)               # [B, K, r]
-    ref_proj = exact_projection(ref_logits, W2_f)           # [B, K, r]
-
-    # du = dL/d(q_proj)
-    # CE: dL_ce/d(q_proj) = ce_weight * (q_proj - teacher_proj)
-    du = ce_weight * (q_proj - teacher_proj)                # [B, K, r]
-
-    # TV: dL_tv/d(q_proj) involves the indicator function.
-    # indicator = (q_softmax < p_softmax) where p = softmax(teacher_logits)
-    # The TV gradient simplifies to: tv_weight * indicator_weighted * q_proj
-    # We computed it numerically via softmax probabilities.
-    q_softmax = torch.softmax(q_logits, dim=-1)             # [B, K, V]
-    p_softmax = torch.softmax(tl, dim=-1)                   # [B, K, V]
-    indicator = (q_softmax < p_softmax).to(torch.float32)   # [B, K, V]
-
-    # TV gradient: tv_weight * (indicator_proj - indicator_sum * q_proj)
-    # where indicator_sum = (indicator * q_softmax) @ W2
-    # and indicator_sum = (indicator * q_softmax).sum(-1, keepdim=True)
-    indicator_weighted = indicator * q_softmax              # [B, K, V]
-    indicator_proj = torch.bmm(indicator_weighted, W2_f.unsqueeze(0).expand(B, -1, -1))  # [B, K, r]
-    indicator_sum = indicator_weighted.sum(-1, keepdim=True)  # [B, K, 1]
-    du = du + tv_weight * (indicator_proj - indicator_sum * q_proj)  # [B, K, r]
-
-    # Anchor: dL_anchor/d(q_proj) = anchor_lambda * (q_proj - ref_proj)
-    du = du + anchor_lambda * (q_proj - ref_proj)           # [B, K, r]
-
-    # Apply position weights
-    du = du * alpha.unsqueeze(-1)                           # [B, K, r]
-
-    # Project to delta: forward applies e @ delta, so
-    # dL/d(delta)[i, j] = sum_k e[k, i] * du[k, j]  ->  e.T @ du
+    # Apply position weights and project to delta: grad = e.T @ (du * alpha)
+    du = du_flat.view(B, K, r) * alpha.unsqueeze(-1)        # [B, K, r]
     delta_grad = torch.einsum('bki,bkj->bij', e, du)        # [B, r, r]
 
     return delta_grad
@@ -160,10 +158,14 @@ def kl_residual_gradient_batch(
     alpha_batch: torch.Tensor,      # [B, K]
     anchor_lambda: float,
     K_actual: int,
+    row_chunk: int = 64,
 ) -> torch.Tensor:
     """Batched KL divergence gradient for vanilla_residual head mode.
 
-    L = sum_k alpha_k * (KL(p_T || q) + anchor_lambda * KL(q_red || q))
+    L = sum_k alpha_k * (KL(p_T || q) + anchor_lambda * KL(q_ref || q))
+
+    Fused like the CE+TV path: one softmax per distribution per row chunk,
+    flattened projection matmuls.
     """
     e = e_batch[:, :K_actual, :].to(torch.float32)
     base = base_batch[:, :K_actual, :].to(torch.float32)
@@ -173,25 +175,27 @@ def kl_residual_gradient_batch(
     alpha = alpha_batch[:, :K_actual].to(torch.float32)
 
     B, K, r = e.shape
+    rows = B * K
 
     e_delta = torch.bmm(e, deltas)
-    bias = torch.bmm(e + e_delta, W2_f.t().unsqueeze(0).expand(B, -1, -1))
-    q_logits = base + bias
+    base_flat = base.reshape(rows, -1)
+    q_logits = base_flat + (e + e_delta).reshape(rows, r) @ W2_f.t()
+    ref_logits = base_flat + e.reshape(rows, r) @ W2_f.t()
+    tl_flat = tl.reshape(rows, -1)
 
-    ref_bias = torch.bmm(e, W2_f.t().unsqueeze(0).expand(B, -1, -1))
-    ref_logits = base + ref_bias
+    du_flat = torch.empty(rows, r, dtype=torch.float32, device=e.device)
+    for start in range(0, rows, row_chunk):
+        end = min(start + row_chunk, rows)
+        q_proj = torch.softmax(q_logits[start:end], dim=-1) @ W2_f
+        teacher_proj = torch.softmax(tl_flat[start:end], dim=-1) @ W2_f
+        ref_proj = torch.softmax(ref_logits[start:end], dim=-1) @ W2_f
+        # KL(teacher || q): (q_proj - teacher_proj);
+        # KL(ref || q): anchor_lambda * (q_proj - ref_proj)
+        du_flat[start:end] = (
+            (q_proj - teacher_proj) + anchor_lambda * (q_proj - ref_proj)
+        )
 
-    q_proj = exact_projection(q_logits, W2_f)
-    teacher_proj = exact_projection(tl, W2_f)
-    ref_proj = exact_projection(ref_logits, W2_f)
-
-    # KL(teacher || q) gradient: (q_proj - teacher_proj)
-    du = (q_proj - teacher_proj)
-
-    # KL(ref || q) gradient: anchor_lambda * (q_proj - ref_proj)
-    du = du + anchor_lambda * (q_proj - ref_proj)
-
-    du = du * alpha.unsqueeze(-1)
+    du = du_flat.view(B, K, r) * alpha.unsqueeze(-1)
     # Forward applies e @ delta, so dL/d(delta) = e.T @ du.
     delta_grad = torch.einsum('bki,bkj->bij', e, du)
     return delta_grad

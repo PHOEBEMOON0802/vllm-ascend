@@ -112,6 +112,29 @@ class TestGradient:
                                                  alpha, 0.5, K, 0.5, 0.5)
         assert torch.allclose(g_masked, g_masked2, atol=1e-5)
 
+    def test_chunked_rows_match_single_chunk(self):
+        """Fused row-chunked path: multi-chunk result must equal the
+        single-chunk result exactly, for both losses."""
+        torch.manual_seed(9)
+        B, Kp = 5, 4  # 20 rows -> 7 chunks at row_chunk=3
+        e = torch.randn(B, Kp, R)
+        base = torch.randn(B, Kp, V)
+        deltas = torch.randn(B, R, R) * 0.1
+        W2 = torch.randn(V, R)
+        tl = torch.randn(B, Kp, V)
+        alpha = position_weights(Kp, 4.0, device="cpu",
+                                 dtype=torch.float32).expand(B, -1)
+        g1 = cetv_residual_gradient_batch(e, base, deltas, W2, tl, alpha,
+                                          0.5, Kp, 0.5, 0.5, row_chunk=3)
+        g2 = cetv_residual_gradient_batch(e, base, deltas, W2, tl, alpha,
+                                          0.5, Kp, 0.5, 0.5, row_chunk=10_000)
+        assert torch.allclose(g1, g2, atol=1e-6)
+        k1 = kl_residual_gradient_batch(e, base, deltas, W2, tl, alpha,
+                                        0.5, Kp, row_chunk=3)
+        k2 = kl_residual_gradient_batch(e, base, deltas, W2, tl, alpha,
+                                        0.5, Kp, row_chunk=10_000)
+        assert torch.allclose(k1, k2, atol=1e-6)
+
     def test_kl_gradient_matches_autograd(self):
         """The analytical KL gradient is exactly the autograd gradient of
         L = sum_k alpha_k * [KL(p_T || q) + anchor * KL(p_ref || q)]
