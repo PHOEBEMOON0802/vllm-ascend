@@ -505,7 +505,11 @@ class BoltManager:
                 return
             target_ids = target_logits[0, :K_actual].argmax(-1)  # [K_actual]
             # Count consecutive matches from position 0 (single host sync).
-            matches = draft_tokens[:K_actual].to(target_ids.device) == target_ids
+            # Cast to int32 before cumprod: NPU aclnnCumprod does not
+            # support bool tensors (AclNN_Parameter_Error EZ1001).
+            matches = (
+                draft_tokens[:K_actual].to(target_ids.device) == target_ids
+            ).to(torch.int32)
             accepted = int(matches.cumprod(0).sum().item())
 
             is_full_block = accepted >= K_actual
