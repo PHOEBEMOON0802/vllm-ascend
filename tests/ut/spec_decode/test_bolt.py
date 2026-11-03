@@ -427,6 +427,26 @@ class TestDebugEnv:
         assert "[BOLT][verify]" in logged
         assert "[BOLT][update]" in logged
         assert "[BOLT][finish]" in logged
+        assert "[BOLT][timing]" in logged
+
+    def test_timing_respects_interval(self, monkeypatch):
+        """Timing line printed every N update calls; stats still accumulate."""
+        monkeypatch.setenv("VLLM_ASCEND_BOLT_DEBUG", "1")
+        monkeypatch.setenv("VLLM_ASCEND_BOLT_DEBUG_INTERVAL", "2")
+        mgr = make_manager()
+        with mock.patch.object(bolt_manager_module.logger, "info") as m:
+            for i in range(4):
+                mgr.on_request_new("a")
+                mgr.save_proposal("a", torch.randn(1, K, R),
+                                  torch.randn(1, K, V),
+                                  torch.randint(0, V, (1, K)))
+                mgr.bolt_update_batch(["a"], [torch.randn(1, K, V)], [K])
+        timing_lines = [
+            c for c in m.call_args_list if "[BOLT][timing]" in str(c)
+        ]
+        assert len(timing_lines) == 2  # calls 2 and 4 of 4
+        assert mgr._update_time_count == 4
+        assert mgr._update_time_sum_ms > 0
 
     def test_no_debug_lines_when_disabled(self, monkeypatch):
         monkeypatch.delenv("VLLM_ASCEND_BOLT_DEBUG", raising=False)

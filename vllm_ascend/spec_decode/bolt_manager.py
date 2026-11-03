@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -284,6 +285,10 @@ class BoltManager:
         self._debug_interval = max(
             1, _env_int("VLLM_ASCEND_BOLT_DEBUG_INTERVAL", 1)
         )
+        # Update-timing accumulators (debug level >= 1 only)
+        self._update_time_sum_ms = 0.0
+        self._update_time_count = 0
+        self._update_time_max_ms = 0.0
         if self._debug_level > 0:
             logger.info(
                 "[BOLT] debug printing enabled: level=%d interval=%d "
@@ -575,6 +580,7 @@ class BoltManager:
                 logger.warning("BOLT: W2 not set, skipping update")
             return
         V_w2 = self.W2.shape[0]
+        _t0 = time.perf_counter() if self._debug_level >= 1 else 0.0
 
         # Gather per-request data
         valid = []
@@ -681,6 +687,26 @@ class BoltManager:
             st.saved_e = None
             st.saved_base = None
             st.saved_draft = None
+
+        if self._debug_level >= 1:
+            # Wall time of the full batched update (gather + gradient +
+            # optimizer steps). The per-step gnorm .item() calls force
+            # host-device sync, so device compute is included.
+            elapsed_ms = (time.perf_counter() - _t0) * 1000.0
+            self._update_time_sum_ms += elapsed_ms
+            self._update_time_count += 1
+            self._update_time_max_ms = max(
+                self._update_time_max_ms, elapsed_ms
+            )
+            if self._update_time_count % self._debug_interval == 0:
+                logger.info(
+                    "[BOLT][timing] update_batch #%d B=%d K=%d steps=%d "
+                    "took %.2f ms (avg %.2f ms, max %.2f ms over %d calls)",
+                    self._update_time_count, B, K_actual, n_update_steps,
+                    elapsed_ms,
+                    self._update_time_sum_ms / self._update_time_count,
+                    self._update_time_max_ms, self._update_time_count,
+                )
 
         if self._debug_level >= 2:
             for rid, st, _, _ in valid:
