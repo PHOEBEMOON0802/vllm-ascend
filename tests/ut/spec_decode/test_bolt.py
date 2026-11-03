@@ -172,13 +172,29 @@ class TestOptimizers:
         gnorm, clipped = opt.step(g)
         assert opt.version == 1
         assert opt.step_count == 1
-        assert gnorm > 0
+        # S3: returns 0-dim tensors (no host sync on the hot path).
+        assert torch.is_tensor(gnorm) and gnorm.ndim == 0
+        assert torch.is_tensor(clipped) and clipped.ndim == 0
+        assert float(gnorm) > 0
         assert not torch.equal(opt.delta, torch.zeros(R, R))
 
     def test_clipping_reported(self):
         opt = RequestSGD((R, R), "cpu", lr=0.01, clip=1e-6)
         _, clipped = opt.step(torch.ones(R, R))
-        assert clipped == 1.0
+        assert float(clipped) == 1.0
+
+    @pytest.mark.parametrize("cls", [RequestMuon, RequestSGD, RequestAdam])
+    def test_clipping_matches_host_formula(self, cls):
+        """Device-side clamp must equal the old host-side min() formula."""
+        torch.manual_seed(11)
+        g = torch.randn(R, R)
+        clip = 0.5
+        opt = cls((R, R), "cpu", lr=0.01, clip=clip)
+        gnorm, clipped = opt.step(g.clone())
+        expected_norm = torch.linalg.vector_norm(g.float()).item()
+        assert abs(float(gnorm) - expected_norm) < 1e-5
+        assert float(clipped) == (1.0 if clip / (expected_norm + 1e-12) < 1.0
+                                  else 0.0)
 
 
 class TestManagerLifecycle:
@@ -219,6 +235,24 @@ class TestManagerLifecycle:
         assert m["req_id"] == "a"
         assert m["verify_rounds"] == 0
 
+    def test_metrics_file_with_tensor_grad_stats(self, tmp_path):
+        """After updates, grad stats are tensor accumulators; the finish
+        path must sync them to plain floats for JSON output."""
+        mgr = make_manager(metrics_dir=str(tmp_path))
+        mgr.on_request_new("a")
+        torch.manual_seed(2)
+        mgr.save_proposal("a", torch.randn(1, K, R), torch.randn(1, K, V),
+                          torch.randint(0, V, (1, K)))
+        mgr.bolt_update_batch(["a"], [torch.randn(1, K, V)], [K])
+        mgr.on_request_finished("a")
+        with open(os.path.join(str(tmp_path), "metrics_a.json")) as f:
+            m = json.load(f)
+        assert m["update_count"] == 1
+        assert isinstance(m["grad_norm_mean"], float)
+        assert m["grad_norm_mean"] > 0
+        assert isinstance(m["grad_norm_max"], float)
+        assert isinstance(m["clip_ratio"], float)
+
 
 class TestRecordVerify:
 
@@ -237,9 +271,9 @@ class TestRecordVerify:
         mgr.record_verify("a", tl)
         st = mgr.states["a"]
         assert st.verify_rounds == 1
-        assert st.accepted_draft_tokens == 2
-        assert st.committed_tokens == 3  # accepted + bonus token
-        assert st.accept_hist[2] == 1
+        assert int(st.accepted_draft_tokens) == 2
+        assert int(st.committed_tokens) == 3  # accepted + bonus token
+        assert int(st.accept_hist[2]) == 1
 
     def test_full_block(self):
         mgr = make_manager()
@@ -251,7 +285,7 @@ class TestRecordVerify:
         for k, tok in enumerate([1, 2, 3, 4]):
             tl[0, k, tok] = 10.0
         mgr.record_verify("a", tl)
-        assert mgr.states["a"].full_block_rounds == 1
+        assert int(mgr.states["a"].full_block_rounds) == 1
 
     def test_without_saved_draft_is_noop(self):
         mgr = make_manager()
@@ -289,7 +323,7 @@ class TestRecordVerify:
         mgr.record_verify("a", tl)
         st = mgr.states["a"]
         assert st.verify_rounds == 1
-        assert st.accepted_draft_tokens == 1
+        assert int(st.accepted_draft_tokens) == 1
         assert st.saved_e is None  # no update tensors retained
 
 

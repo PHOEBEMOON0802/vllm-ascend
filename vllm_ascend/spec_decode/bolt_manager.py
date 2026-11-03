@@ -59,7 +59,8 @@ class RequestMuon:
     Uses Newton-Schulz orthogonalization (5 iterations) with Nesterov momentum.
     Reference: https://github.com/KellerJordan/Muon
 
-    Interface: ``.delta``, ``.step(gradient) -> (gnorm, clipped)``, ``.version``
+    Interface: ``.delta``, ``.step(gradient) -> (gnorm, clipped)`` as 0-dim
+    device tensors (no host sync on the hot path), ``.version``
     """
 
     def __init__(self, shape, device, lr=0.005, momentum=0.95, clip=1.0):
@@ -72,12 +73,13 @@ class RequestMuon:
         self.version = 0
 
     @torch.no_grad()
-    def step(self, gradient: torch.Tensor) -> tuple[float, float]:
+    def step(self, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         g = gradient.float()
-        gnorm = torch.linalg.vector_norm(g).item()
-        factor = self.clip / (gnorm + 1e-12)
-        clipped = 1.0 if factor < 1.0 else 0.0
-        factor = min(factor, 1.0)
+        # Clip entirely on device: a gnorm .item() here would force a
+        # host-device sync per request per step (measured ms-level on NPU).
+        gnorm = torch.linalg.vector_norm(g)
+        factor = torch.clamp(self.clip / (gnorm + 1e-12), max=1.0)
+        clipped = (factor < 1.0).to(torch.float32)
         g = g * factor
         self.step_count += 1
 
@@ -102,7 +104,8 @@ class RequestMuon:
 class RequestSGD:
     """SGD with optional momentum and gradient clipping.
 
-    Interface: ``.delta``, ``.step(gradient) -> (gnorm, clipped)``, ``.version``
+    Interface: ``.delta``, ``.step(gradient) -> (gnorm, clipped)`` as 0-dim
+    device tensors (no host sync on the hot path), ``.version``
     """
 
     def __init__(self, shape, device, lr=0.005, momentum=0.0, clip=1.0):
@@ -115,12 +118,11 @@ class RequestSGD:
         self.version = 0
 
     @torch.no_grad()
-    def step(self, gradient: torch.Tensor) -> tuple[float, float]:
+    def step(self, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         g = gradient.float()
-        gnorm = torch.linalg.vector_norm(g).item()
-        factor = self.clip / (gnorm + 1e-12)
-        clipped = 1.0 if factor < 1.0 else 0.0
-        factor = min(factor, 1.0)
+        gnorm = torch.linalg.vector_norm(g)
+        factor = torch.clamp(self.clip / (gnorm + 1e-12), max=1.0)
+        clipped = (factor < 1.0).to(torch.float32)
         g = g * factor
         self.step_count += 1
         if self.momentum > 0:
@@ -134,7 +136,8 @@ class RequestSGD:
 class RequestAdam:
     """Standard Adam optimizer for per-request delta.
 
-    Interface: ``.delta``, ``.step(gradient) -> (gnorm, clipped)``, ``.version``
+    Interface: ``.delta``, ``.step(gradient) -> (gnorm, clipped)`` as 0-dim
+    device tensors (no host sync on the hot path), ``.version``
     """
 
     def __init__(self, shape, device, lr=0.005, beta1=0.9, beta2=0.999,
@@ -151,12 +154,11 @@ class RequestAdam:
         self.version = 0
 
     @torch.no_grad()
-    def step(self, gradient: torch.Tensor) -> tuple[float, float]:
+    def step(self, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         g = gradient.float()
-        gnorm = torch.linalg.vector_norm(g).item()
-        factor = self.clip / (gnorm + 1e-12)
-        clipped = 1.0 if factor < 1.0 else 0.0
-        factor = min(factor, 1.0)
+        gnorm = torch.linalg.vector_norm(g)
+        factor = torch.clamp(self.clip / (gnorm + 1e-12), max=1.0)
+        clipped = (factor < 1.0).to(torch.float32)
         g = g * factor
         self.step_count += 1
         self.m.mul_(self.beta1).add_(g, alpha=1 - self.beta1)
@@ -174,21 +176,30 @@ class RequestAdam:
 
 @dataclass
 class ReqState:
-    """Per-request BOLT state."""
+    """Per-request BOLT state.
+
+    Counters annotated ``int | torch.Tensor`` start as host ints and become
+    0-dim device tensors after the first verify block: the hot path
+    accumulates on device (no sync); they are converted back to Python
+    numbers only at request finish or debug-print time.
+    """
     optimizer: RequestMuon | RequestSGD | RequestAdam | None = None
     update_count: int = 0
     verify_rounds: int = 0
-    accepted_draft_tokens: int = 0
-    committed_tokens: int = 0
-    zero_accept_rounds: int = 0
-    full_block_rounds: int = 0
-    last_accepted: int = 0
-    # Per-round acceptance histogram: accept_counts[k] = # rounds with k accepted
-    accept_hist: list = field(default_factory=lambda: [0] * 8)
-    # Gradient statistics
-    grad_norm_sum: float = 0.0
-    grad_norm_max: float = 0.0
-    clip_ratio_sum: float = 0.0
+    accepted_draft_tokens: int | torch.Tensor = 0
+    committed_tokens: int | torch.Tensor = 0
+    zero_accept_rounds: int | torch.Tensor = 0
+    full_block_rounds: int | torch.Tensor = 0
+    last_accepted: int | torch.Tensor = 0
+    # Per-round acceptance histogram: accept_hist[k] = # rounds with k
+    # accepted. Lazily becomes a device int64 tensor of size 8.
+    accept_hist: list | torch.Tensor = field(default_factory=lambda: [0] * 8)
+    # Gradient statistics. Accumulated as 0-dim device tensors on the hot
+    # path (no host sync); converted to floats only at request finish or
+    # debug-print time.
+    grad_norm_sum: float | torch.Tensor = 0.0
+    grad_norm_max: float | torch.Tensor = 0.0
+    clip_ratio_sum: float | torch.Tensor = 0.0
     # Count of verify blocks that offered an update opportunity; used to
     # honor bolt_config.update_interval (update on blocks 1, 1+N, 1+2N...).
     update_opportunities: int = 0
@@ -359,6 +370,7 @@ class BoltManager:
         self._output_request_metrics(req_id, st, self._finish_counter)
         if self._debug_level >= 1:
             rounds = max(1, st.verify_rounds)
+            accepted_total = int(st.accepted_draft_tokens)
             delta_max = (
                 st.optimizer.delta.abs().max().item()
                 if st.optimizer is not None and st.update_count > 0 else 0.0
@@ -367,10 +379,10 @@ class BoltManager:
                 "[BOLT][finish] req=%s rounds=%d accepted_total=%d "
                 "tau=%.3f tau_bonus=%.3f committed=%d updates=%d "
                 "delta_max=%.6f",
-                req_id, st.verify_rounds, st.accepted_draft_tokens,
-                st.accepted_draft_tokens / rounds,
-                (st.accepted_draft_tokens + st.verify_rounds) / rounds,
-                st.committed_tokens, st.update_count, delta_max,
+                req_id, st.verify_rounds, accepted_total,
+                accepted_total / rounds,
+                (accepted_total + st.verify_rounds) / rounds,
+                int(st.committed_tokens), st.update_count, delta_max,
             )
 
     def _output_request_metrics(self, req_id: str, st: ReqState, finish_idx: int):
@@ -398,28 +410,37 @@ class BoltManager:
             )
 
     def _compute_metrics(self, st: ReqState) -> dict:
+        # int()/float() sync the device-tensor accumulators; this runs at
+        # request finish (or diagnostics), never on the per-step hot path.
         rounds = max(1, st.verify_rounds)
+        accepted = int(st.accepted_draft_tokens)
+        zero_rounds = int(st.zero_accept_rounds)
+        full_rounds = int(st.full_block_rounds)
+        hist = (
+            st.accept_hist.tolist()
+            if torch.is_tensor(st.accept_hist) else list(st.accept_hist)
+        )
         return {
             "verify_rounds": st.verify_rounds,
-            "accepted_draft_tokens": st.accepted_draft_tokens,
-            "committed_tokens": st.committed_tokens,
-            "zero_accept_rounds": st.zero_accept_rounds,
-            "full_block_rounds": st.full_block_rounds,
-            "tau_no_bonus": st.accepted_draft_tokens / rounds,
-            "tau_with_bonus": (st.accepted_draft_tokens + rounds) / rounds,
-            "j0": st.zero_accept_rounds / rounds,
-            "full_block_rate": st.full_block_rounds / rounds,
+            "accepted_draft_tokens": accepted,
+            "committed_tokens": int(st.committed_tokens),
+            "zero_accept_rounds": zero_rounds,
+            "full_block_rounds": full_rounds,
+            "tau_no_bonus": accepted / rounds,
+            "tau_with_bonus": (accepted + rounds) / rounds,
+            "j0": zero_rounds / rounds,
+            "full_block_rate": full_rounds / rounds,
             "update_count": st.update_count,
             "delta_max": (
                 st.optimizer.delta.abs().max().item()
                 if st.update_count > 0 else 0.0
             ),
-            "grad_norm_mean": st.grad_norm_sum / max(1, st.update_count),
-            "grad_norm_max": st.grad_norm_max,
-            "clip_ratio": st.clip_ratio_sum / max(1, st.update_count),
-            "accept_hist": st.accept_hist[:8],
+            "grad_norm_mean": float(st.grad_norm_sum) / max(1, st.update_count),
+            "grad_norm_max": float(st.grad_norm_max),
+            "clip_ratio": float(st.clip_ratio_sum) / max(1, st.update_count),
+            "accept_hist": hist[:8],
             "p_a_ge_k": [
-                sum(st.accept_hist[k:]) / max(1, rounds) for k in range(8)
+                sum(hist[k:]) / max(1, rounds) for k in range(8)
             ],
         }
 
@@ -510,43 +531,52 @@ class BoltManager:
             if K_actual <= 0:
                 return
             target_ids = target_logits[0, :K_actual].argmax(-1)  # [K_actual]
-            # Count consecutive matches from position 0 (single host sync).
-            # Cast to int32 before cumprod: NPU aclnnCumprod does not
-            # support bool tensors (AclNN_Parameter_Error EZ1001).
+            # Count consecutive matches from position 0, fully on device:
+            # an .item() here would be a per-step host sync. Cast to int32
+            # before cumprod (NPU aclnnCumprod does not support bool,
+            # AclNN_Parameter_Error EZ1001).
             matches = (
                 draft_tokens[:K_actual].to(target_ids.device) == target_ids
             ).to(torch.int32)
-            accepted = int(matches.cumprod(0).sum().item())
-
-            is_full_block = accepted >= K_actual
+            accepted = matches.cumprod(0).sum().long()  # 0-dim tensor
 
             st.verify_rounds += 1
-            st.accepted_draft_tokens += accepted
-            st.committed_tokens += accepted + 1
-            if accepted == 0:
-                st.zero_accept_rounds += 1
-            if is_full_block:
-                st.full_block_rounds += 1
-            if accepted < len(st.accept_hist):
-                st.accept_hist[accepted] += 1
-            else:
-                st.accept_hist[-1] += 1
+            st.accepted_draft_tokens = st.accepted_draft_tokens + accepted
+            st.committed_tokens = st.committed_tokens + accepted + 1
+            st.zero_accept_rounds = (
+                st.zero_accept_rounds + (accepted == 0).to(torch.int64)
+            )
+            st.full_block_rounds = (
+                st.full_block_rounds + (accepted >= K_actual).to(torch.int64)
+            )
+            if not torch.is_tensor(st.accept_hist):
+                st.accept_hist = torch.zeros(
+                    8, dtype=torch.int64, device=accepted.device
+                )
+            st.accept_hist.index_put_(
+                (accepted.clamp(max=7).unsqueeze(0),),
+                torch.ones(1, dtype=torch.int64, device=accepted.device),
+                accumulate=True,
+            )
             st.last_accepted = accepted
 
             if (
                 self._debug_level >= 1
                 and st.verify_rounds % self._debug_interval == 0
             ):
+                # Debug-only host syncs (int()) — not on the production
+                # hot path.
                 rounds = st.verify_rounds
+                accepted_total = int(st.accepted_draft_tokens)
                 logger.info(
                     "[BOLT][verify] req=%s round=%d accepted=%d/%d "
                     "tau=%.3f tau_bonus=%.3f zero_pct=%.1f full_pct=%.1f "
                     "updates=%d",
-                    req_id, rounds, accepted, K_actual,
-                    st.accepted_draft_tokens / rounds,
-                    (st.accepted_draft_tokens + rounds) / rounds,
-                    100.0 * st.zero_accept_rounds / rounds,
-                    100.0 * st.full_block_rounds / rounds,
+                    req_id, rounds, int(accepted), K_actual,
+                    accepted_total / rounds,
+                    (accepted_total + rounds) / rounds,
+                    100.0 * int(st.zero_accept_rounds) / rounds,
+                    100.0 * int(st.full_block_rounds) / rounds,
                     st.update_count,
                 )
         except Exception:
@@ -687,13 +717,17 @@ class BoltManager:
                     tl_batch, alpha_batch, self.anchor_lambda, K_actual,
                 )  # [B, r, r]
 
-            # Apply per-req optimizer steps
+            # Apply per-req optimizer steps. gnorm/clipped are 0-dim device
+            # tensors; accumulate without syncing (floats only at finish).
             for i, (rid, st, _, _) in enumerate(valid):
                 gnorm, clipped = st.optimizer.step(grads[i])
                 st.update_count += 1
-                st.grad_norm_sum += gnorm
-                st.grad_norm_max = max(st.grad_norm_max, gnorm)
-                st.clip_ratio_sum += clipped
+                st.grad_norm_sum = st.grad_norm_sum + gnorm
+                st.grad_norm_max = (
+                    torch.maximum(st.grad_norm_max, gnorm)
+                    if torch.is_tensor(st.grad_norm_max) else gnorm.clone()
+                )
+                st.clip_ratio_sum = st.clip_ratio_sum + clipped
 
         # Clear saved data
         for _, st, _, _ in valid:
@@ -703,8 +737,12 @@ class BoltManager:
 
         if self._debug_level >= 1:
             # Wall time of the full batched update (gather + gradient +
-            # optimizer steps). The per-step gnorm .item() calls force
-            # host-device sync, so device compute is included.
+            # optimizer steps). With the hot path now sync-free, an explicit
+            # device synchronize is needed here so the measurement still
+            # covers device compute; this cost is paid only in debug mode.
+            dev_mod = getattr(torch, self.device.type, None)
+            if dev_mod is not None and hasattr(dev_mod, "synchronize"):
+                dev_mod.synchronize()
             elapsed_ms = (time.perf_counter() - _t0) * 1000.0
             self._update_time_sum_ms += elapsed_ms
             self._update_time_count += 1
@@ -722,15 +760,17 @@ class BoltManager:
                 )
 
         if self._debug_level >= 2:
+            # Debug-only host syncs (float()/.item()) — not on the
+            # production hot path.
             for rid, st, _, _ in valid:
                 dn = st.optimizer.delta.abs().max().item()
                 logger.info(
                     "[BOLT][update] req=%s update#%d delta_max=%.6f "
                     "grad_norm_mean=%.4f grad_norm_max=%.4f clip_ratio=%.2f",
                     rid, st.update_count, dn,
-                    st.grad_norm_sum / max(1, st.update_count),
-                    st.grad_norm_max,
-                    st.clip_ratio_sum / max(1, st.update_count),
+                    float(st.grad_norm_sum) / max(1, st.update_count),
+                    float(st.grad_norm_max),
+                    float(st.clip_ratio_sum) / max(1, st.update_count),
                 )
 
     # ---- Legacy / utility ----
