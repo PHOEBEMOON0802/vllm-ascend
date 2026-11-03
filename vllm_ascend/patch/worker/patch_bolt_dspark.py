@@ -92,9 +92,10 @@ def _patch_bolt_dspark():
         logger.info(
             "BOLT manager initialized: r=%d, d=%d, K=%d, "
             "optimizer=%s, lr=%s, enabled=%s, device=%s, "
-            "head_mode=%s, loss=%s",
+            "head_mode=%s, loss=%s, update_interval=%d",
             r, d, K, bolt_config.optimizer, bolt_config.lr,
-            bolt_mgr.enabled, device, bolt_config.head_mode, bolt_config.loss,
+            bolt_mgr.enabled, device, bolt_config.head_mode,
+            bolt_config.loss, bolt_config.update_interval,
         )
 
     Qwen3DSparkForCausalLM.__init__ = _patched_init

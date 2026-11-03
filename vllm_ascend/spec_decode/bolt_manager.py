@@ -189,6 +189,9 @@ class ReqState:
     grad_norm_sum: float = 0.0
     grad_norm_max: float = 0.0
     clip_ratio_sum: float = 0.0
+    # Count of verify blocks that offered an update opportunity; used to
+    # honor bolt_config.update_interval (update on blocks 1, 1+N, 1+2N...).
+    update_opportunities: int = 0
     # Saved proposal outputs (set during propose, consumed during update)
     saved_e: torch.Tensor | None = None       # [1, K, r] markov embeddings
     saved_base: torch.Tensor | None = None    # [1, K, V] base logits
@@ -590,6 +593,16 @@ class BoltManager:
                 continue
             if st.saved_round != self.propose_round:
                 # Stale proposal (its drafts were never verified) — drop it.
+                st.saved_e = None
+                st.saved_base = None
+                st.saved_draft = None
+                continue
+            # update_interval throttling: the first opportunity updates,
+            # then every Nth. Skipped blocks still release their saved
+            # tensors (consumed by this round's verify already).
+            st.update_opportunities += 1
+            interval = self.config.update_interval
+            if interval > 1 and (st.update_opportunities - 1) % interval != 0:
                 st.saved_e = None
                 st.saved_base = None
                 st.saved_draft = None

@@ -1392,6 +1392,13 @@ class BoltConfig:
     # Number of update steps per verify block (multi-step on fixed proposal).
     update_steps: int = 1
 
+    # Run the delta update only every N verify blocks per request (the
+    # first block always updates, then every Nth). 1 = update every block
+    # (original behavior). Raising this divides BOLT's per-step update
+    # cost by ~N at the price of slower adaptation; verify metrics are
+    # still recorded on every block.
+    update_interval: int = 1
+
     # Debug mode: print per-block update statistics.
     debug: bool = False
 
@@ -1425,6 +1432,11 @@ class BoltConfig:
         if self.update_steps < 1:
             raise ValueError(
                 f"bolt_config.update_steps must be >= 1, got {self.update_steps}"
+            )
+        if self.update_interval < 1:
+            raise ValueError(
+                f"bolt_config.update_interval must be >= 1, "
+                f"got {self.update_interval}"
             )
         if self.ce_weight < 0 or self.tv_weight < 0:
             raise ValueError(

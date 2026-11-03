@@ -40,6 +40,7 @@ def make_config(**overrides):
         clip=1.0,
         metrics_dir="",
         update_steps=1,
+        update_interval=1,
         debug=False,
     )
     cfg.update(overrides)
@@ -356,6 +357,34 @@ class TestUpdateBatch:
         assert st.saved_e is None  # stale tensors released
         mgr.bolt_update_batch(["a"], [torch.randn(1, K, V)], [K])
         assert st.update_count == 0
+
+    def _one_cycle(self, mgr, rid):
+        """save_proposal + bolt_update_batch + begin_round (prod order)."""
+        torch.manual_seed(0)
+        mgr.save_proposal(rid, torch.randn(1, K, R), torch.randn(1, K, V),
+                          torch.randint(0, V, (1, K)))
+        mgr.bolt_update_batch([rid], [torch.randn(1, K, V)], [K])
+        mgr.begin_round()
+
+    def test_update_interval_throttles(self):
+        """interval=4 over 8 blocks -> updates on blocks 1 and 5 only;
+        skipped blocks release their saved tensors."""
+        mgr = make_manager(update_interval=4)
+        mgr.on_request_new("a")
+        st = mgr.states["a"]
+        expected = [1, 1, 1, 1, 2, 2, 2, 2]
+        for i in range(8):
+            self._one_cycle(mgr, "a")
+            assert st.update_count == expected[i]
+            assert st.saved_e is None  # released whether updated or skipped
+        assert st.update_opportunities == 8
+
+    def test_update_interval_one_is_default_behavior(self):
+        mgr = make_manager(update_interval=1)
+        mgr.on_request_new("a")
+        for i in range(3):
+            self._one_cycle(mgr, "a")
+        assert mgr.states["a"].update_count == 3
 
     def test_delta_applied_direction_reduces_loss(self):
         """One SGD step on a fixed objective should reduce the CE+anchor
