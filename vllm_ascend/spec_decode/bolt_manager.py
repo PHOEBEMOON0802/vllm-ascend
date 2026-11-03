@@ -22,13 +22,13 @@ Flow: propose (save_proposal) → verify (record_verify) → update (bolt_update
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.logger import logger
 
 from vllm_ascend.spec_decode.bolt_gradient import (
     cetv_residual_gradient_batch,
@@ -38,8 +38,6 @@ from vllm_ascend.spec_decode.bolt_gradient import (
 
 if TYPE_CHECKING:
     from vllm_ascend.ascend_config import BoltConfig
-
-logger = logging.getLogger(__name__)
 
 
 def _env_int(name: str, default: int) -> int:

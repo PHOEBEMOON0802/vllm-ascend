@@ -3,10 +3,12 @@
 import json
 import os
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 
+from vllm_ascend.spec_decode import bolt_manager as bolt_manager_module
 from vllm_ascend.spec_decode.bolt_gradient import (
     cetv_residual_gradient_batch,
     exact_projection,
@@ -407,7 +409,7 @@ class TestDebugEnv:
         assert mgr._debug_level == 0
         assert mgr._debug_interval == 1
 
-    def test_debug_smoke_full_cycle(self, monkeypatch, caplog):
+    def test_debug_smoke_full_cycle(self, monkeypatch):
         """Debug printing must not break verify/update/finish, and must
         emit the expected lines at level 2."""
         monkeypatch.setenv("VLLM_ASCEND_BOLT_DEBUG", "2")
@@ -417,26 +419,26 @@ class TestDebugEnv:
         torch.manual_seed(0)
         mgr.save_proposal("a", torch.randn(1, K, R), torch.randn(1, K, V),
                           torch.randint(0, V, (1, K)))
-        with caplog.at_level(
-                "INFO", logger="vllm_ascend.spec_decode.bolt_manager"):
+        with mock.patch.object(bolt_manager_module.logger, "info") as m:
             mgr.record_verify("a", torch.randn(1, K, V))
             mgr.bolt_update_batch(["a"], [torch.randn(1, K, V)], [K])
             mgr.on_request_finished("a")
-        assert "[BOLT][verify]" in caplog.text
-        assert "[BOLT][update]" in caplog.text
-        assert "[BOLT][finish]" in caplog.text
+        logged = " | ".join(str(c) for c in m.call_args_list)
+        assert "[BOLT][verify]" in logged
+        assert "[BOLT][update]" in logged
+        assert "[BOLT][finish]" in logged
 
-    def test_no_debug_lines_when_disabled(self, monkeypatch, caplog):
+    def test_no_debug_lines_when_disabled(self, monkeypatch):
         monkeypatch.delenv("VLLM_ASCEND_BOLT_DEBUG", raising=False)
         mgr = make_manager()
         mgr.on_request_new("a")
         mgr.save_proposal("a", torch.randn(1, K, R), torch.randn(1, K, V),
                           torch.randint(0, V, (1, K)))
-        with caplog.at_level(
-                "INFO", logger="vllm_ascend.spec_decode.bolt_manager"):
+        with mock.patch.object(bolt_manager_module.logger, "info") as m:
             mgr.record_verify("a", torch.randn(1, K, V))
             mgr.bolt_update_batch(["a"], [torch.randn(1, K, V)], [K])
             mgr.on_request_finished("a")
-        assert "[BOLT][verify]" not in caplog.text
-        assert "[BOLT][update]" not in caplog.text
-        assert "[BOLT][finish]" not in caplog.text
+        logged = " | ".join(str(c) for c in m.call_args_list)
+        assert "[BOLT][verify]" not in logged
+        assert "[BOLT][update]" not in logged
+        assert "[BOLT][finish]" not in logged

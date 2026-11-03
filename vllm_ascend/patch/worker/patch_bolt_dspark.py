@@ -33,12 +33,12 @@ DSpark families (Kimi, DeepSeek variants) do not get a ``bolt_manager`` and
 BOLT stays inactive for them.
 """
 
-import logging
+# Use vLLM's configured logger so INFO lines reach the server console;
+# a bare logging.getLogger here has no handler and drops INFO silently.
+from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.spec_decode.bolt_manager import BoltManager
-
-logger = logging.getLogger(__name__)
 
 
 def _patch_bolt_dspark():
