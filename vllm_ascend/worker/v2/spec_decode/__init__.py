@@ -66,7 +66,14 @@ def init_speculator(
 
         return AscendDSparkSpeculator(vllm_config, device)
     if speculative_config.use_dflash():
-        if "DFlash2DraftModel" in speculative_config.draft_model_config.architectures:
+        draft_architectures = speculative_config.draft_model_config.architectures or ()
+        if "DMTP2DraftModel" in draft_architectures:
+            from vllm_ascend.worker.v2.spec_decode.dmtp2.speculator import (
+                AscendDMTP2Speculator,
+            )
+
+            return AscendDMTP2Speculator(vllm_config, device)
+        if "DFlash2DraftModel" in draft_architectures:
             from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import (
                 AscendDFlash2Speculator,
             )

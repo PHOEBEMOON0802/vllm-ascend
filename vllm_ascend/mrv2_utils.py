@@ -29,7 +29,7 @@ else:
 
 _NGRAM_SPEC_METHODS = frozenset({"ngram", "ngram_gpu"})
 _P_EAGLE_SPEC_METHODS = frozenset({"eagle", "eagle3"})
-_DFLASH2_ARCHITECTURES = frozenset({"DFlash2DraftModel"})
+_DFLASH2_ARCHITECTURES = frozenset({"DFlash2DraftModel", "DMTP2DraftModel"})
 
 
 def _is_configured(value: object) -> bool:

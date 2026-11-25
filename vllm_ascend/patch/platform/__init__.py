@@ -48,6 +48,7 @@ import vllm_ascend.patch.platform.patch_engine_core  # noqa
 
 import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
 import vllm_ascend.patch.platform.patch_speculative_config  # noqa
+import vllm_ascend.patch.platform.patch_speculators_dmtp2  # noqa
 import vllm_ascend.patch.platform.patch_replayssm_config  # noqa
 
 import vllm_ascend.patch.platform.patch_eplb  # noqa
