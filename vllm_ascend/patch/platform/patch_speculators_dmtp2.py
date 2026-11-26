@@ -28,12 +28,12 @@ fail to load. Two adaptations here:
    handled. Runtime dispatch still keys off the draft architectures, in
    ``vllm_ascend.worker.v2.spec_decode.init_speculator``.
 
-The reference also flips ``needs_eagle_block_drop()`` on for dmtp2: the frozen
-MTP block's KV is EAGLE-style (row t depends on ``x_{t+1}``) even though the
-DFlash2 trunk's is not. That is patched here too.
+No extra block-drop patch is needed: this vLLM keeps the trailing-block drop
+for every ``use_eagle()`` method (``use_eagle_block_drop`` is
+``use_eagle() and not disable_eagle_block_drop``, and ``use_eagle()`` covers
+``dflash``), which is what D-MTP2's EAGLE-style MTP KV requires.
 """
 
-import vllm.config.speculative as speculative_module
 from vllm.transformers_utils.configs.speculators.algos import (
     SUPPORTED_SPECULATORS_TYPES,
     update_dflash2,
@@ -75,18 +75,3 @@ def _build_vllm_speculative_config(cls, config_dict: dict) -> dict:
 SpeculatorsConfig.build_vllm_speculative_config = classmethod(
     _build_vllm_speculative_config
 )
-
-
-_orig_needs_eagle_block_drop = speculative_module.SpeculativeConfig.needs_eagle_block_drop
-
-
-def _needs_eagle_block_drop(self) -> bool:
-    draft = getattr(self, "draft_model_config", None)
-    if draft is not None and DMTP2_ARCHITECTURE in (
-        getattr(draft, "architectures", None) or ()
-    ):
-        return True
-    return _orig_needs_eagle_block_drop(self)
-
-
-speculative_module.SpeculativeConfig.needs_eagle_block_drop = _needs_eagle_block_drop
