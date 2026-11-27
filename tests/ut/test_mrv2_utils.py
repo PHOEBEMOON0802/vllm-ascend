@@ -225,15 +225,25 @@ def test_blacklist_logs_fallback(monkeypatch):
     monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
     monkeypatch.setattr(mrv2_utils.logger, "warning_once", lambda *args, **kwargs: warning_calls.append(args))
 
-    config = SimpleNamespace(
-        speculative_config=SimpleNamespace(
-            method="dflash",
-            draft_model_config=SimpleNamespace(architectures=["DFlash2DraftModel"]),
-        )
-    )
+    config = SimpleNamespace(speculative_config=SimpleNamespace(method="suffix"))
     assert use_v2_model_runner(config) is False
     assert len(warning_calls) == 1
-    assert "dflash2 graph" in warning_calls[0][1]
+    assert "suffix speculative decoding" in warning_calls[0][1]
+
+
+def test_dflash2_and_dmtp2_drafts_stay_on_v2(monkeypatch):
+    """DFlash2/DMTP2 drafts are graph-capable, so a non-eager draft must not be
+    blacklisted from the V2 runner."""
+    monkeypatch.setattr(mrv2_utils.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", None)
+    for arch in ("DFlash2DraftModel", "DMTP2DraftModel"):
+        config = SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="dflash",
+                enforce_eager=False,
+                draft_model_config=SimpleNamespace(architectures=[arch]),
+            )
+        )
+        assert use_v2_model_runner(config) is True
 
 
 def test_validation_is_decoupled_from_upstream():

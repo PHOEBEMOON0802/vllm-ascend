@@ -309,7 +309,7 @@ def test_eager_speculator_keeps_target_compilation_and_graph_config():
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
 
 
-def test_init_cudagraph_manager_requires_enforce_eager(monkeypatch):
+def test_init_cudagraph_manager_delegates_to_dflash_graph_path(monkeypatch):
     calls: list[CUDAGraphMode] = []
     monkeypatch.setattr(
         "vllm_ascend.worker.v2.spec_decode.dflash.speculator.AscendDFlashSpeculator.init_cudagraph_manager",
@@ -322,12 +322,11 @@ def test_init_cudagraph_manager_requires_enforce_eager(monkeypatch):
     speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
     assert calls == [CUDAGraphMode.NONE]
 
-    # Graph mode is rejected until the Ascend walk kernel is capturable, and
-    # must fail before delegating to the parent manager.
+    # Graph mode is forwarded unchanged; the DFlash base decides whether the
+    # draft attention backend supports a FULL capture.
     speculator.speculative_config = SimpleNamespace(enforce_eager=False)
-    with pytest.raises(NotImplementedError, match="graph mode"):
-        speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
-    assert calls == [CUDAGraphMode.NONE]
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
+    assert calls == [CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY]
 
 
 def test_greedy_walk_contract_reference():

@@ -30,7 +30,8 @@ passes:
 
 Bring-up limits (guarded with clear errors at construction):
 
-- drafting runs eagerly (the MTP pass and the T1 injection are not captured);
+- the MTP pass and the T1 injection run eagerly; only the DFlash2 pass is
+  captured in the draft ACL graph (``enforce_eager`` forces all of it eager);
 - greedy draft sampling only;
 - no data parallelism / EPLB for the MTP MoE forward.
 
@@ -135,9 +136,12 @@ class AscendDMTP2Speculator(AscendDFlash2Speculator):
     # -- bring-up ---------------------------------------------------------
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        # The MTP pass and the T1 injection between the two draft passes are
-        # not captured yet, so the draft runs eagerly.
-        super().init_cudagraph_manager(CUDAGraphMode.NONE)
+        # Only the DFlash2 pass is captured (via ``_generate_draft``). The
+        # frozen-MTP pass and the T1 injection stay eager in ``propose``: they
+        # write ``t1_tokens`` / ``t1_hidden`` / the draft input buffers before
+        # the graph replays, and the captured region reads those persistent
+        # buffers. ``enforce_eager`` still forces the whole draft eager.
+        super().init_cudagraph_manager(cudagraph_mode)
 
     def load_draft_model(
         self,

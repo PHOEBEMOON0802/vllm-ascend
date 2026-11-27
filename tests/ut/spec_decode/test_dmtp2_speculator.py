@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.dflash2 import speculator as dflash2_spec
 
 from vllm_ascend.worker.v2.spec_decode.dmtp2.speculator import AscendDMTP2Speculator
@@ -160,6 +161,20 @@ def test_propose_t1_uses_pinned_prepare_prefill_inputs():
     # The MTP forward reads the buffers the kernel wrote, not a batched shift.
     mtp_ids = speculator.model.mtp_forward.call_args.kwargs["input_ids"]
     assert torch.equal(mtp_ids, speculator.input_buffers.input_ids[:num_tokens])
+
+
+def test_init_cudagraph_manager_forwards_requested_mode(monkeypatch):
+    """Only the DFlash2 pass is captured, so the requested graph mode reaches
+    the shared DFlash ACL-graph manager unchanged."""
+    calls: list[CUDAGraphMode] = []
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.spec_decode.dflash.speculator.AscendDFlashSpeculator.init_cudagraph_manager",
+        lambda self, mode: calls.append(mode),
+    )
+    speculator = AscendDMTP2Speculator.__new__(AscendDMTP2Speculator)
+
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
+    assert calls == [CUDAGraphMode.FULL_DECODE_ONLY]
 
 
 def test_init_rejects_single_speculative_token():
