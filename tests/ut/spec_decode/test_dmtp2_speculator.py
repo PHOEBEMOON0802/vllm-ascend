@@ -16,6 +16,7 @@
 #
 """Unit tests for the V2 D-MTP2 speculator (worker/v2/spec_decode/dmtp2)."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -90,33 +91,75 @@ def test_sample_buffers_select_slots_after_t1(num_speculative_steps):
     assert indices.numel() == num_reqs * (num_speculative_steps - 1)
 
 
-def test_mtp_inputs_shift_and_last_row():
+def test_propose_t1_uses_pinned_prepare_prefill_inputs():
+    """_propose_t1 must not hand-roll the shift on whole-batch tensors.
+
+    The earlier plain-tensor port broadcast ``next_token[req]`` (num_reqs)
+    against per-row tensors (num_tokens) and crashed once the two differed.
+    The pinned kernel does the shift per request; assert we call it.
+    """
     speculator = _build_speculator(num_speculative_steps=3)
     num_reqs = 2
-    query_start = torch.tensor([0, 3, 6], dtype=torch.int64)
+    num_tokens = 6
+
+    speculator.input_buffers = SimpleNamespace(
+        input_ids=torch.tensor([11, 99, 0, 21, 22, 66], dtype=torch.int64),
+        positions=torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int64),
+    )
+    speculator.block_tables = SimpleNamespace(
+        slot_mappings=torch.zeros(1, num_tokens, dtype=torch.int64)
+    )
+    speculator.kv_cache_config = object()
+    speculator._group_causal = False
+    speculator._build_attn_metadata = MagicMock(return_value={})
+    speculator.model = MagicMock()
+    speculator.model.mtp_forward.return_value = torch.zeros(
+        num_tokens, speculator.hidden_size
+    )
+    speculator.model.compute_t1_logits.return_value = torch.zeros(num_reqs, 5)
+
     input_batch = SimpleNamespace(
         num_reqs=num_reqs,
-        num_tokens=6,
-        query_start_loc=query_start,
+        num_tokens=num_tokens,
+        num_tokens_after_padding=num_tokens,
+        query_start_loc_np=[0, 3, 6],
+        seq_lens_cpu_upper_bound=torch.tensor([3, 3], dtype=torch.int32),
         idx_mapping=torch.tensor([0, 1], dtype=torch.int64),
-        input_ids=torch.tensor([10, 11, 12, 20, 21, 22], dtype=torch.int64),
-        positions=torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int64),
+        query_start_loc=torch.tensor([0, 3, 6], dtype=torch.int64),
     )
     num_sampled = torch.tensor([1, 0], dtype=torch.int64)
     num_rejected = torch.tensor([1, 0], dtype=torch.int64)
     last_sampled = torch.tensor([99, 88], dtype=torch.int64)
     next_prefill = torch.tensor([77, 66], dtype=torch.int64)
 
-    ids, positions, row_end = speculator._mtp_inputs(
-        input_batch, num_sampled, num_rejected, last_sampled, next_prefill
-    )
+    with (
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.dmtp2.speculator.prepare_prefill_inputs"
+        ) as prepare,
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.dmtp2.speculator.build_slot_mappings_by_layer",
+            return_value={},
+        ),
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.dmtp2.speculator.set_forward_context",
+            side_effect=lambda *a, **k: nullcontext(),
+        ),
+    ):
+        speculator._propose_t1(
+            input_batch,
+            {},
+            {},
+            torch.zeros(num_tokens, speculator.hidden_size),
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill,
+        )
 
-    # Request 0 keeps rows 0..1 (row 2 is rejected); row 0 -> x_1, row 1 -> next.
-    # Request 1 keeps rows 3..5; rows 3,4 shift, row 5 -> next prefill token.
-    assert row_end.tolist() == [2, 6]
-    assert ids.tolist() == [11, 99, 0, 21, 22, 66]
-    assert torch.equal(positions, input_batch.positions)
-    assert speculator.mtp_last_token_indices[:num_reqs].tolist() == [1, 5]
+    prepare.assert_called_once()
+    # The MTP forward reads the buffers the kernel wrote, not a batched shift.
+    mtp_ids = speculator.model.mtp_forward.call_args.kwargs["input_ids"]
+    assert torch.equal(mtp_ids, speculator.input_buffers.input_ids[:num_tokens])
 
 
 def test_init_rejects_single_speculative_token():

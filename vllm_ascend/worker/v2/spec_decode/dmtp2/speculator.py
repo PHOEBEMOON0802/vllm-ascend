@@ -51,6 +51,9 @@ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.dflash2 import speculator as _dflash2_spec
+from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+    prepare_prefill_inputs,
+)
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
 from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import (
@@ -126,14 +129,8 @@ class AscendDMTP2Speculator(AscendDFlash2Speculator):
         self.mtp_last_token_indices = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
-        # Private buffers for the shifted MTP inputs, so the draft input
-        # buffers stay untouched for ``prepare_dflash_inputs``.
-        self._mtp_input_ids = torch.zeros(
-            self.max_num_tokens, dtype=torch.int64, device=device
-        )
-        self._mtp_positions = torch.zeros(
-            self.max_num_tokens, dtype=torch.int64, device=device
-        )
+        # prepare_prefill_inputs resets this scratch to 0 every call.
+        self._mtp_step_scratch = torch.zeros((), dtype=torch.int64, device=device)
 
     # -- bring-up ---------------------------------------------------------
 
@@ -156,58 +153,6 @@ class AscendDMTP2Speculator(AscendDFlash2Speculator):
     # -- MTP first-token pass ---------------------------------------------
 
     @torch.inference_mode()
-    def _mtp_inputs(
-        self,
-        input_batch: InputBatch,
-        num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
-        last_sampled: torch.Tensor,
-        next_prefill_tokens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Per-request one-token shift of the target batch for the MTP pass.
-
-        The MTP predictor consumes ``(h_t, emb(x_{t+1}))`` per row, so each
-        request's scheduled tokens are shifted by one inside its own query
-        segment and the last row carries the next token to be sampled/prefilled.
-
-        This mirrors the pinned vLLM's ``prepare_prefill_inputs`` kernel but is
-        written as plain tensor ops: the pinned tree this port targets does not
-        ship the ``spec_decode.autoregressive`` subpackage that the reference
-        implementation imports from.
-        """
-        num_reqs = input_batch.num_reqs
-        num_tokens = input_batch.num_tokens
-
-        query_start = input_batch.query_start_loc[:num_reqs]
-        query_end = input_batch.query_start_loc[1 : num_reqs + 1]
-        # Rejected draft tokens are not part of the kept prefix.
-        row_end = query_end - num_rejected[:num_reqs]
-
-        state = input_batch.idx_mapping[:num_reqs]
-        next_token = torch.where(
-            num_sampled[:num_reqs] > 0,
-            last_sampled[state],
-            next_prefill_tokens[state],
-        ).to(torch.int64)
-
-        rows = torch.arange(num_tokens, device=self.device)
-        # Request owning each row; rows past a request's kept prefix are dropped.
-        req = torch.searchsorted(query_start, rows, right=True) - 1
-        req = req.clamp(min=0)
-        owned = (req < num_reqs) & (rows < row_end[req])
-
-        shifted = input_batch.input_ids[(rows + 1).clamp(max=num_tokens - 1)].to(
-            torch.int64
-        )
-        is_last_row = owned & (rows + 1 >= row_end[req])
-        ids = torch.where(is_last_row, next_token[req], shifted)
-        ids = torch.where(owned, ids, torch.zeros_like(ids))
-
-        positions = input_batch.positions[:num_tokens].to(torch.int64)
-        self.mtp_last_token_indices[:num_reqs] = row_end - 1
-        return ids, positions, row_end
-
-    @torch.inference_mode()
     def _propose_t1(
         self,
         input_batch: InputBatch,
@@ -228,15 +173,23 @@ class AscendDMTP2Speculator(AscendDFlash2Speculator):
         num_reqs = input_batch.num_reqs
         num_tokens_padded = input_batch.num_tokens_after_padding
 
-        mtp_ids, mtp_positions, _ = self._mtp_inputs(
+        # Shift the target tokens one position left inside each request's
+        # query segment and record its last valid row. Writes the draft input
+        # buffers, which ``prepare_dflash_inputs`` refills for the DFlash2
+        # pass immediately after.
+        prepare_prefill_inputs(
+            self.mtp_last_token_indices,
+            self._mtp_step_scratch,
+            self.input_buffers,
             input_batch,
             num_sampled,
             num_rejected,
             last_sampled,
             next_prefill_tokens,
+            self.max_num_reqs,
         )
-        self._mtp_input_ids[: mtp_ids.shape[0]] = mtp_ids
-        self._mtp_positions[: mtp_positions.shape[0]] = mtp_positions
+        mtp_ids = self.input_buffers.input_ids[:num_tokens_padded]
+        mtp_positions = self.input_buffers.positions[:num_tokens_padded]
 
         batch_desc = BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
@@ -268,8 +221,8 @@ class AscendDMTP2Speculator(AscendDFlash2Speculator):
             batch_descriptor=BatchDescriptor(num_tokens=num_tokens_padded),
         ):
             mtp_hidden = self.model.mtp_forward(
-                input_ids=self._mtp_input_ids[:num_tokens_padded],
-                positions=self._mtp_positions[:num_tokens_padded],
+                input_ids=mtp_ids,
+                positions=mtp_positions,
                 hidden_states=last_hidden_states[:num_tokens_padded],
             )
 
