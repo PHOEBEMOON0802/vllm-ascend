@@ -84,10 +84,27 @@ class AscendDMTP2Speculator(AscendDFlash2Speculator):
                 "D-MTP2's MTP pass does not synchronize token counts across "
                 "data-parallel ranks yet."
             )
+        if vllm_config.parallel_config.use_ubatching:
+            raise NotImplementedError(
+                "D-MTP2 cannot reuse the target attention metadata with "
+                "ubatching enabled."
+            )
+        if vllm_config.parallel_config.enable_eplb:
+            raise NotImplementedError(
+                "D-MTP2 does not prepare EPLB state for the frozen MTP MoE "
+                "forward yet."
+            )
 
         # Dual-anchor layout: slot 0 is the bonus anchor, slot 1 is T1, and only
         # the remaining block slots are drafted by the DFlash2 pass.
         self.num_sample_steps = self.num_speculative_steps - 1
+
+        # The base constructor sized this for ``num_speculative_steps``; the
+        # re-indexed sample buffers carry one fewer step, and the walk kernel
+        # strides by ``self.num_steps``.
+        self.candidate_sampler = _dflash2_spec.CandidateSampler(
+            self.max_num_reqs, self.num_sample_steps, self.top_k, device
+        )
 
         self._fusion_rows = (
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
@@ -385,49 +402,38 @@ class AscendDMTP2Speculator(AscendDFlash2Speculator):
         candidate_ids, unary_logits = self.model.compute_candidates(
             hidden_states.flatten(0, 1)
         )
-        candidate_ids = candidate_ids.view(num_reqs, self.num_sample_steps, self.selector_top_k)
+        candidate_ids = candidate_ids.view(num_reqs, self.num_sample_steps, self.top_k)
         unary_logits = unary_logits.view_as(candidate_ids)
-        # The first walked slot's predecessor is T1, not the anchor.
-        scores = self.model.model.candidate_selector(
-            candidate_ids, unary_logits, hidden_states, t1
-        )
-        self._sample_path_with(
-            candidate_ids, scores, num_reqs, sample_pos, sample_idx_mapping
-        )
-        self.draft_tokens[:num_reqs, 0] = t1
-        self.draft_tokens[:num_reqs, 1:] = self.walk_tokens[:num_reqs]
-
-    def _sample_path_with(
-        self,
-        candidate_ids: torch.Tensor,
-        scores: torch.Tensor,
-        num_reqs: int,
-        sample_pos: torch.Tensor,
-        sample_idx_mapping: torch.Tensor,
-    ) -> None:
-        """``DFlash2Speculator._sample_path`` with the DMTP2 step count.
-
-        The Ascend selector-walk kernel is patched over upstream's module
-        global, so it is looked up at call time.
-        """
-        from vllm.triton_utils import triton
-
-        block_k = triton.next_power_of_2(self.selector_top_k)
-        _dflash2_spec._selector_walk_kernel[(num_reqs,)](
-            scores.contiguous(),
-            candidate_ids.contiguous(),
+        scores = self._score_candidates(candidate_ids, unary_logits, hidden_states)
+        self.candidate_sampler.sample(
+            candidate_ids,
+            scores,
+            num_reqs,
             sample_pos,
             sample_idx_mapping,
             self.temperature,
             self.seeds,
             self.walk_tokens,
-            self._selector_scores,
-            num_steps=self.num_sample_steps,
-            top_k=self.selector_top_k,
-            BLOCK_K=block_k,
-            SAMPLE_PROBABILISTIC=False,
-            USE_FP64=self.use_fp64_gumbel,
-            num_warps=1,
+            None,  # draft_logits: greedy-only
+            self.use_fp64_gumbel,
+        )
+        self.draft_tokens[:num_reqs, 0] = t1
+        self.draft_tokens[:num_reqs, 1:] = self.walk_tokens[:num_reqs]
+
+    def _score_candidates(
+        self,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Selector scores seeded with T1 as the first predecessor.
+
+        DFlash2 seeds the walk from the anchor; DMTP2's first walked slot
+        follows the MTP-proposed T1, so the predecessor column is T1.
+        """
+        t1 = self.t1_tokens[: candidate_ids.shape[0]]
+        return self.model.model.candidate_selector(
+            candidate_ids, unary_logits, hidden_states, t1
         )
 
     @torch.inference_mode()
